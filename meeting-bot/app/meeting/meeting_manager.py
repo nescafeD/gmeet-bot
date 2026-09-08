@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+from dataclasses import replace
 
 from app.core.exceptions import MeetingNotFoundError
 from app.core.request_context import bind
@@ -65,12 +66,51 @@ class MeetingManager:
         return self._sessions.get(meeting_id)
 
     def require_session(self, meeting_id: str) -> MeetingSession:
-        """Look up a session.
+        """Look up the session a request is for.
+
+        The id a caller addresses a session by is not always the id the session
+        was registered under. A client that derives the id from the meeting URL
+        on one call and reads it from its own state on the next sends two
+        different strings for one meeting; the join is also free to mint or
+        suffix an id the caller never sees. Resolving strictly turns all of that
+        into a 404 on a bot that is plainly sitting in the meeting being asked
+        about, so the lookup widens in steps, each one still unambiguous:
+
+        1. The id as given.
+        2. The one session minted from it — ``<given>-<suffix>``, which is what
+           :meth:`join_meeting` produces when it disambiguates.
+        3. The only session there is. A pod runs one meeting at a time in the
+           normal case, so "the meeting" is not in doubt even when the id is.
+
+        Ambiguity is never guessed at: two candidates at any step fall through
+        rather than picking one. Every inexact match is logged, because it means
+        a caller is addressing sessions by an id the server did not give it.
 
         Raises:
-            MeetingNotFoundError: If no session exists for this meeting.
+            MeetingNotFoundError: If no session matches, or more than one does.
         """
-        return self._sessions.require(meeting_id)
+        session = self._sessions.get(meeting_id)
+        if session is not None:
+            return session
+
+        prefix = f"{meeting_id}-"
+        minted = [s for s in self._sessions.all() if s.meeting_id.startswith(prefix)]
+        if len(minted) == 1:
+            logger.warning(
+                "Meeting id matched a session by its generated suffix",
+                extra={"requested_meeting_id": meeting_id, "meeting_id": minted[0].meeting_id},
+            )
+            return minted[0]
+
+        active = self._sessions.all()
+        if len(active) == 1:
+            logger.warning(
+                "Unknown meeting id resolved to the only active session",
+                extra={"requested_meeting_id": meeting_id, "meeting_id": active[0].meeting_id},
+            )
+            return active[0]
+
+        raise MeetingNotFoundError(meeting_id)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -84,12 +124,33 @@ class MeetingManager:
         the caller gets an identifier immediately and polls
         :meth:`session_status` for progress.
 
+        The id the session ends up under is the one on the returned session,
+        not necessarily the one that was asked for: a caller rejoining a meeting
+        it is already in gets a suffixed id rather than a rejected request. That
+        id is what every later call must address the session by, so the join
+        response carries it back.
+
         Raises:
-            MeetingAlreadyActiveError: If this meeting already has a session, or
-                the process is at its session limit.
+            MeetingAlreadyActiveError: If the process is at its session limit.
         """
-        session = MeetingSession(request, self._deps)
-        await self._sessions.add(session)
+        # Settled before the session exists, because MeetingRequest is frozen
+        # and the session takes its identity from it.
+        meeting_id = await self._sessions.reserve_meeting_id(request.meeting_id)
+        if meeting_id != request.meeting_id:
+            logger.info(
+                "Meeting id already in use; assigned a unique one",
+                extra={"requested_meeting_id": request.meeting_id, "meeting_id": meeting_id},
+            )
+            request = replace(request, meeting_id=meeting_id)
+
+        try:
+            session = MeetingSession(request, self._deps)
+            await self._sessions.add(session)
+        except BaseException:
+            # Nothing will ever register this id now; holding it would leak a
+            # key and push the next join of the same meeting onto a suffix.
+            await self._sessions.release_meeting_id(meeting_id)
+            raise
 
         with bind(meeting_id=request.meeting_id, session_id=session.session_id):
             logger.info(
@@ -129,14 +190,17 @@ class MeetingManager:
         Raises:
             MeetingNotFoundError: If no session exists for this meeting.
         """
-        session = self._sessions.require(meeting_id)
-        with bind(meeting_id=meeting_id, session_id=session.session_id):
+        session = self.require_session(meeting_id)
+        # The session's own id, not the one asked for: resolution is allowed to
+        # be inexact, and removing by the requested id would stop the session
+        # while leaving it registered forever.
+        with bind(meeting_id=session.meeting_id, session_id=session.session_id):
             try:
                 await self._stop_session(session)
             finally:
                 # Always deregister: a session that failed to stop cleanly must
                 # not block a later join for the same meeting.
-                await self._sessions.remove(meeting_id)
+                await self._sessions.remove(session.meeting_id)
 
     async def shutdown(self) -> None:
         """Stop every session. Called during application shutdown.
@@ -217,7 +281,7 @@ class MeetingManager:
             generate_incremental_highlights: Whether to request highlights for segments.
             mode_ids: Highlight mode identifiers for this recording only.
         """
-        await self._sessions.require(meeting_id).start_recording(
+        await self.require_session(meeting_id).start_recording(
             max_duration_seconds=max_duration_seconds,
             generate_incremental_highlights=generate_incremental_highlights,
             mode_ids=mode_ids,
@@ -225,7 +289,7 @@ class MeetingManager:
 
     async def stop_recording(self, meeting_id: str) -> None:
         """Stop recording and finalize the upload."""
-        await self._sessions.require(meeting_id).stop_recording()
+        await self.require_session(meeting_id).stop_recording()
 
     # ------------------------------------------------------------------
     # Transcription
@@ -233,19 +297,19 @@ class MeetingManager:
 
     async def start_transcription(self, meeting_id: str) -> None:
         """Begin producing a transcript."""
-        await self._sessions.require(meeting_id).start_transcription()
+        await self.require_session(meeting_id).start_transcription()
 
     async def stop_transcription(self, meeting_id: str) -> list[TranscriptSegment]:
         """Stop transcribing and return the transcript."""
-        return await self._sessions.require(meeting_id).stop_transcription()
+        return await self.require_session(meeting_id).stop_transcription()
 
     def get_transcript(self, meeting_id: str) -> list[TranscriptSegment]:
         """The transcript so far, without stopping transcription."""
-        return self._sessions.require(meeting_id).transcript()
+        return self.require_session(meeting_id).transcript()
 
     def get_chat_messages(self, meeting_id: str) -> list[ChatMessage]:
         """Chat messages collected so far."""
-        return self._sessions.require(meeting_id).chat_messages()
+        return self.require_session(meeting_id).chat_messages()
 
     # ------------------------------------------------------------------
     # Media
@@ -253,7 +317,7 @@ class MeetingManager:
 
     async def play_audio(self, meeting_id: str, audio_url: str, volume: float = 0.7) -> bool:
         """Play audio into a meeting."""
-        return await self._sessions.require(meeting_id).play_audio(audio_url, volume)
+        return await self.require_session(meeting_id).play_audio(audio_url, volume)
 
     async def set_microphone(self, meeting_id: str, *, enabled: bool) -> bool:
         """Mute or unmute the bot.
@@ -262,7 +326,7 @@ class MeetingManager:
             MeetingNotFoundError: If the session exists but has not joined yet,
                 so there is no meeting UI to act on.
         """
-        session = self._sessions.require(meeting_id)
+        session = self.require_session(meeting_id)
         if session.platform is None:
             raise MeetingNotFoundError(meeting_id)
         return await (
@@ -275,7 +339,7 @@ class MeetingManager:
 
     def session_status(self, meeting_id: str) -> dict:
         """Live status for one session."""
-        return self._sessions.require(meeting_id).status_snapshot()
+        return self.require_session(meeting_id).status_snapshot()
 
     def all_status(self) -> list[dict]:
         """Live status for every session."""

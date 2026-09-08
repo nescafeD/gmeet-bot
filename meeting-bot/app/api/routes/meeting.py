@@ -38,6 +38,10 @@ async def join_meeting(
     Returns as soon as the session is registered. The bot may then wait several
     minutes in the lobby for a host to admit it, so progress is reported through
     ``GET /meetings/{meeting_id}/status`` rather than by blocking this call.
+
+    ``meetingId`` in the response is the session's real id and may differ from
+    the one sent: it is minted when the caller omits it, and suffixed when the
+    caller's id is already in use. Address every later call by the returned id.
     """
     request = MeetingRequest.build(
         meeting_id=payload.meeting_id,

@@ -21,11 +21,16 @@ class JoinMeetingRequest(CamelCaseModel):
         min_length=1,
         description="Full meeting URL, e.g. https://meet.google.com/abc-defg-hij",
     )
-    meeting_id: str = Field(
-        ...,
+    meeting_id: str | None = Field(
+        default=None,
         alias="meetingId",
-        min_length=1,
-        description="Caller-assigned identifier. All later calls address the session by this id.",
+        description=(
+            "Optional caller-assigned identifier. Omit it and one is minted from "
+            "the meeting code. Either way the id in the response — not the one "
+            "sent here — is what all later calls must address the session by: a "
+            "rejoin of a meeting already in progress is given a suffixed id "
+            "rather than being rejected."
+        ),
     )
     user_name: str | None = Field(default=None, alias="userName")
     user_email: str | None = Field(default=None, alias="userEmail")
@@ -41,13 +46,18 @@ class JoinMeetingRequest(CamelCaseModel):
             raise ValueError("meetingUrl must be an absolute http(s) URL")
         return candidate
 
-    @field_validator("meeting_id")
+    @field_validator("meeting_id", mode="before")
     @classmethod
-    def _validate_meeting_id(cls, value: str) -> str:
-        candidate = value.strip()
-        if not candidate:
-            raise ValueError("meetingId must not be blank")
-        return candidate
+    def _normalise_meeting_id(cls, value: object) -> str | None:
+        """Blank is 'not supplied', not an error — the server mints one instead.
+
+        Coerced with ``str`` because a caller sending a numeric id would
+        otherwise key the session under an int and never match its own string
+        on the calls that follow.
+        """
+        if value is None:
+            return None
+        return str(value).strip() or None
 
 
 class MeetingActionRequest(CamelCaseModel):

@@ -351,7 +351,7 @@ class CWUtilsClient(BaseHTTPClient):
     async def _startup_mh_services_request(self) -> None:
         """Internal coroutine to request MH services startup."""
         try:
-            await self.post_json(
+            await self.get_json(
                 self._ENDPOINT_STARTUP_MH_SERVICES,
                 operation="startup_mh_services",
             )
